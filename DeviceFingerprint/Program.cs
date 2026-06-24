@@ -1,12 +1,14 @@
 ﻿using System;
+using DeviceFingerprint.Fingerprint;
 
 namespace DeviceFingerprint
 {
     internal class Program
     {
-        static void Main(string[] args)
+        static void Main()
         {
-            Console.WriteLine("Hello World!");
+            var fingerprint = FingerPrinter.GetRawDeviceId();
+            Console.WriteLine($"Device Fingerprint — {fingerprint}");
         }
     }
 }
