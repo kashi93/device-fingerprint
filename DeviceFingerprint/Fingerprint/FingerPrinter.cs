@@ -2,8 +2,12 @@ using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Win32;
 
@@ -15,40 +19,98 @@ public static class FingerPrinter
 
     public static Device GetRawDeviceId()
     {
+        OSPlatform platform = GetCurrentPlatform();
+
+        string id;
+
+        try
+        {
+            if (platform == OSPlatform.Windows)
+            {
+                id = GetWindowsMachineGuid();
+            }
+            else if (platform == OSPlatform.Linux)
+            {
+                id = GetLinuxMachineId();
+            }
+            else if (platform == OSPlatform.OSX)
+            {
+                id = GetMacOsPlatformUuid();
+            }
+            else
+            {
+                throw new PlatformNotSupportedException("Unsupported operating system.");
+            }
+        }
+        catch (Exception ex) when (ex is SecurityException or UnauthorizedAccessException or IOException
+            or Win32Exception or InvalidOperationException)
+        {
+            // The native device id could not be read (e.g. denied registry access, sandboxed
+            // ioreg, missing machine-id file). Fall back to an id derived from hardware signals
+            // so devices that hit this path don't all collapse to the same identifier.
+            id = GetHardwareFallbackId();
+        }
+
+        return new Device { Id = id, Platform = platform };
+    }
+
+    private static OSPlatform GetCurrentPlatform()
+    {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            return new Device { Id = GetWindowsMachineGuid(), Platform = OSPlatform.Windows };
+            return OSPlatform.Windows;
         }
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
-            return new Device { Id = GetLinuxMachineId(), Platform = OSPlatform.Linux };
+            return OSPlatform.Linux;
         }
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
-            return new Device { Id = GetMacOsPlatformUuid(), Platform = OSPlatform.OSX };
+            return OSPlatform.OSX;
         }
 
         throw new PlatformNotSupportedException("Unsupported operating system.");
     }
 
+    private static string GetHardwareFallbackId()
+    {
+        string[] macAddresses = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(nic => nic.NetworkInterfaceType != NetworkInterfaceType.Loopback
+                && nic.NetworkInterfaceType != NetworkInterfaceType.Tunnel)
+            .Select(nic => nic.GetPhysicalAddress().ToString())
+            .Where(mac => !string.IsNullOrEmpty(mac) && mac != "000000000000")
+            .Distinct()
+            .OrderBy(mac => mac, StringComparer.Ordinal)
+            .ToArray();
+
+        if (macAddresses.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "Unable to derive a fallback device id: no usable network adapter MAC addresses found.");
+        }
+
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('|', macAddresses)));
+        var guid = new Guid(hash[..16]);
+
+        return Normalize(guid.ToString());
+    }
+
     private static string GetWindowsMachineGuid()
     {
-        try
-        {
 #pragma warning disable CA1416 // Validate platform compatibility
-            string? value = Registry
-                .GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography", "MachineGuid", null)
-                ?.ToString();
+        string? value = Registry
+            .GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography", "MachineGuid", null)
+            ?.ToString();
 #pragma warning restore CA1416 // Validate platform compatibility
 
-            return Normalize(value);
-        }
-        catch (Exception ex) when (ex is SecurityException or UnauthorizedAccessException or IOException)
+        if (string.IsNullOrWhiteSpace(value))
         {
-            return "";
+            throw new InvalidOperationException("MachineGuid not found in registry.");
         }
+
+        return Normalize(value);
     }
 
     private static string Normalize(string? value)
@@ -58,16 +120,7 @@ public static class FingerPrinter
 
     private static string GetMacOsPlatformUuid()
     {
-        string output;
-
-        try
-        {
-            output = RunCommand(MacOsIoregPath, "-rd1 -c IOPlatformExpertDevice");
-        }
-        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
-        {
-            return "";
-        }
+        string output = RunCommand(MacOsIoregPath, "-rd1 -c IOPlatformExpertDevice");
 
         foreach (string line in output.Split('\n'))
         {
@@ -82,12 +135,13 @@ public static class FingerPrinter
             }
         }
 
-        return "";
+        throw new InvalidOperationException("IOPlatformUUID not found in ioreg output.");
     }
 
     private static string GetLinuxMachineId()
     {
         string[] paths = ["/etc/machine-id", "/var/lib/dbus/machine-id"];
+        IOException? lastError = null;
 
         foreach (string path in paths)
         {
@@ -95,16 +149,21 @@ public static class FingerPrinter
             {
                 if (File.Exists(path))
                 {
-                    return Normalize(File.ReadAllText(path));
+                    string value = Normalize(File.ReadAllText(path));
+
+                    if (!string.IsNullOrEmpty(value))
+                    {
+                        return value;
+                    }
                 }
             }
-            catch (IOException)
+            catch (IOException ex)
             {
-                // Try the next candidate path.
+                lastError = ex;
             }
         }
 
-        return "";
+        throw new IOException("Unable to determine Linux machine id from known paths.", lastError);
     }
 
     private static string RunCommand(string fileName, string arguments)
